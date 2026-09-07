@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -253,30 +254,83 @@ func TestGroupMutationsDoNotRetry(t *testing.T) {
 	}
 }
 
-func TestHasGroupMembershipFiltersByAccountAndGroup(t *testing.T) {
+func TestHasGroupMembershipCachesGroupMembers(t *testing.T) {
 	t.Parallel()
 
+	var calls atomic.Int32
 	handler := func(r *http.Request) *http.Response {
 		var request map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Error(err)
 		}
-		if got := request["accountIds"]; !reflect.DeepEqual(got, []any{"712020:account"}) {
-			t.Errorf("accountIds = %#v", got)
+		if request["accountIds"] != nil {
+			t.Errorf("accountIds = %#v, want omitted", request["accountIds"])
 		}
 		if got := request["groupIds"]; !reflect.DeepEqual(got, []any{"group"}) {
 			t.Errorf("groupIds = %#v", got)
 		}
-		return jsonResponse(r, http.StatusOK, `{"data":[{"accountId":"712020:account"}],"links":{}}`)
+		calls.Add(1)
+		return jsonResponse(r, http.StatusOK, `{"data":[{"accountId":"712020:account"},{"accountId":"712020:other"}],"links":{}}`)
 	}
 
 	service := newTestService(t, handler)
-	present, err := service.HasGroupMembership(context.Background(), "org", "directory", "group", "712020:account")
-	if err != nil {
-		t.Fatal(err)
+	for accountID, want := range map[string]bool{
+		"712020:account": true,
+		"712020:other":   true,
+		"712020:missing": false,
+	} {
+		present, err := service.HasGroupMembership(context.Background(), "org", "directory", "group", accountID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if present != want {
+			t.Fatalf("HasGroupMembership(%q) = %t, want %t", accountID, present, want)
+		}
 	}
-	if !present {
-		t.Fatal("HasGroupMembership() = false, want true")
+	if calls.Load() != 1 {
+		t.Fatalf("search calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestHasGroupMembershipCoalescesPlanReads(t *testing.T) {
+	t.Parallel()
+
+	const (
+		groupCount = 86
+		readCount  = 455
+	)
+	var calls atomic.Int32
+	service := newTestService(t, func(r *http.Request) *http.Response {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+		}
+		groupIDs, ok := request["groupIds"].([]any)
+		if !ok || len(groupIDs) != 1 {
+			t.Errorf("groupIds = %#v, want one group filter", request["groupIds"])
+		}
+		calls.Add(1)
+		return jsonResponse(r, http.StatusOK, `{"data":[],"links":{}}`)
+	})
+
+	start := make(chan struct{})
+	errs := make(chan error, readCount)
+	for i := 0; i < readCount; i++ {
+		go func(i int) {
+			<-start
+			groupID := fmt.Sprintf("group-%d", i%groupCount)
+			_, err := service.HasGroupMembership(context.Background(), "org", "directory", groupID, fmt.Sprintf("account-%d", i))
+			errs <- err
+		}(i)
+	}
+	close(start)
+	for i := 0; i < readCount; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls.Load() != groupCount {
+		t.Fatalf("search calls = %d, want %d for %d membership reads", calls.Load(), groupCount, readCount)
 	}
 }
 
@@ -317,6 +371,55 @@ func TestGroupMembershipMutationsUseV2EndpointsWithoutRetry(t *testing.T) {
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestGroupMembershipMutationsInvalidateMembershipCache(t *testing.T) {
+	t.Parallel()
+
+	var searches atomic.Int32
+	handler := func(r *http.Request) *http.Response {
+		switch r.URL.Path {
+		case "/admin/v2/orgs/org/directories/directory/users/search":
+			searches.Add(1)
+			return jsonResponse(r, http.StatusOK, `{"data":[{"accountId":"712020:account"}],"links":{}}`)
+		case "/admin/v2/orgs/org/directories/directory/groups/group/memberships":
+			return jsonResponse(r, http.StatusNoContent, "")
+		case "/admin/v2/orgs/org/directories/directory/groups/group/memberships/712020:account":
+			return jsonResponse(r, http.StatusNoContent, "")
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			return jsonResponse(r, http.StatusInternalServerError, "")
+		}
+	}
+
+	service := newTestService(t, handler)
+	for _, mutation := range []func() error{
+		func() error {
+			_, err := service.HasGroupMembership(context.Background(), "org", "directory", "group", "712020:account")
+			return err
+		},
+		func() error {
+			return service.AddGroupMembership(context.Background(), "org", "directory", "group", "712020:account")
+		},
+		func() error {
+			_, err := service.HasGroupMembership(context.Background(), "org", "directory", "group", "712020:account")
+			return err
+		},
+		func() error {
+			return service.RemoveGroupMembership(context.Background(), "org", "directory", "group", "712020:account")
+		},
+		func() error {
+			_, err := service.HasGroupMembership(context.Background(), "org", "directory", "group", "712020:account")
+			return err
+		},
+	} {
+		if err := mutation(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if searches.Load() != 3 {
+		t.Fatalf("search calls = %d, want 3", searches.Load())
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/folio-sec/terraform-provider-atlassian/internal/client/admin"
 	"github.com/folio-sec/terraform-provider-atlassian/internal/client/admin/organization/generated"
@@ -37,7 +38,21 @@ type apiClient interface {
 // client. Pagination, Terraform-facing types, and idempotency policy remain in
 // this handwritten layer.
 type Service struct {
-	client apiClient
+	client          apiClient
+	membershipMu    sync.Mutex
+	membershipCache map[membershipCacheKey]*membershipCacheEntry
+}
+
+type membershipCacheKey struct {
+	organizationID string
+	directoryID    string
+	groupID        string
+}
+
+type membershipCacheEntry struct {
+	ready   chan struct{}
+	members map[string]struct{}
+	err     error
 }
 
 func NewService(client *admin.Client) (*Service, error) {
@@ -49,7 +64,10 @@ func NewService(client *admin.Client) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("configure Organization API client: %w", err)
 	}
-	return &Service{client: generatedClient}, nil
+	return &Service{
+		client:          generatedClient,
+		membershipCache: make(map[membershipCacheKey]*membershipCacheEntry),
+	}, nil
 }
 
 type SearchUsersRequest struct {
@@ -239,25 +257,59 @@ func (s *Service) searchGroupPage(ctx context.Context, organizationID, directory
 // HasGroupMembership reports whether the user belongs to the group in the
 // specified directory.
 func (s *Service) HasGroupMembership(ctx context.Context, organizationID, directoryID, groupID, accountID string) (bool, error) {
-	users, err := s.SearchUsers(ctx, organizationID, directoryID, SearchUsersRequest{
-		AccountIDs: []string{accountID},
-		GroupIDs:   []string{groupID},
-	})
+	key := membershipCacheKey{organizationID: organizationID, directoryID: directoryID, groupID: groupID}
+
+	s.membershipMu.Lock()
+	entry, ok := s.membershipCache[key]
+	if !ok {
+		entry = &membershipCacheEntry{ready: make(chan struct{})}
+		s.membershipCache[key] = entry
+	}
+	s.membershipMu.Unlock()
+
+	if ok {
+		select {
+		case <-entry.ready:
+		case <-ctx.Done():
+			return false, fmt.Errorf("wait for group membership lookup: %w", ctx.Err())
+		}
+		if entry.err != nil {
+			return false, entry.err
+		}
+		_, present := entry.members[accountID]
+		return present, nil
+	}
+
+	users, err := s.SearchUsers(ctx, organizationID, directoryID, SearchUsersRequest{GroupIDs: []string{groupID}})
+	members := make(map[string]struct{}, len(users))
+	if err == nil {
+		for _, user := range users {
+			members[user.AccountID] = struct{}{}
+		}
+	}
+
+	s.membershipMu.Lock()
+	entry.members = members
+	entry.err = err
+	if err != nil && s.membershipCache[key] == entry {
+		delete(s.membershipCache, key)
+	}
+	close(entry.ready)
+	s.membershipMu.Unlock()
+
 	if err != nil {
 		return false, fmt.Errorf("check group membership: %w", err)
 	}
-	for _, user := range users {
-		if user.AccountID == accountID {
-			return true, nil
-		}
-	}
-	return false, nil
+	_, present := members[accountID]
+	return present, nil
 }
 
 // AddGroupMembership adds a user to a group in the specified directory.
 func (s *Service) AddGroupMembership(ctx context.Context, organizationID, directoryID, groupID, accountID string) error {
+	s.invalidateMembershipCache(organizationID, directoryID, groupID)
 	request := generated.AddUserToGroupJSONRequestBody{AccountId: accountID}
 	response, err := s.client.AddUserToGroupWithResponse(admin.WithoutRetry(ctx), organizationID, directoryID, groupID, request)
+	s.invalidateMembershipCache(organizationID, directoryID, groupID)
 	if err != nil {
 		return fmt.Errorf("add group membership: %w", err)
 	}
@@ -269,7 +321,9 @@ func (s *Service) AddGroupMembership(ctx context.Context, organizationID, direct
 
 // RemoveGroupMembership removes a user from a group in the specified directory.
 func (s *Service) RemoveGroupMembership(ctx context.Context, organizationID, directoryID, groupID, accountID string) error {
+	s.invalidateMembershipCache(organizationID, directoryID, groupID)
 	response, err := s.client.RemoveUserFromGroupWithResponse(admin.WithoutRetry(ctx), organizationID, directoryID, groupID, accountID)
+	s.invalidateMembershipCache(organizationID, directoryID, groupID)
 	if err != nil {
 		return fmt.Errorf("remove group membership: %w", err)
 	}
@@ -277,6 +331,13 @@ func (s *Service) RemoveGroupMembership(ctx context.Context, organizationID, dir
 		return fmt.Errorf("remove group membership: %w", responseError(response.HTTPResponse, response.Body))
 	}
 	return nil
+}
+
+func (s *Service) invalidateMembershipCache(organizationID, directoryID, groupID string) {
+	key := membershipCacheKey{organizationID: organizationID, directoryID: directoryID, groupID: groupID}
+	s.membershipMu.Lock()
+	delete(s.membershipCache, key)
+	s.membershipMu.Unlock()
 }
 
 // AssignUserRole grants a platform role for a resource to a user.
