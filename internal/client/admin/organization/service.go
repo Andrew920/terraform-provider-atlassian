@@ -282,10 +282,8 @@ func (s *Service) HasGroupMembership(ctx context.Context, organizationID, direct
 
 	users, err := s.SearchUsers(ctx, organizationID, directoryID, SearchUsersRequest{GroupIDs: []string{groupID}})
 	members := make(map[string]struct{}, len(users))
-	if err == nil {
-		for _, user := range users {
-			members[user.AccountID] = struct{}{}
-		}
+	for _, user := range users {
+		members[user.AccountID] = struct{}{}
 	}
 
 	s.membershipMu.Lock()
